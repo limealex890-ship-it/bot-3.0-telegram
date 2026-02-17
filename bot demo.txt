@@ -1,0 +1,1117 @@
+import logging
+import json
+import os
+import asyncio
+import random
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+INFINITE_RATING = float('inf')
+
+# Безопасное получение конфиденциальных данных из переменных окружения
+ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "").split(",") if id]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+
+DATA_FILE = "bot_data.json"
+ANIMALS_FILE = "animals.json"
+ACHIEVEMENTS_FILE = "achievements.json"
+BANNED_USERS_FILE = "banned_users.json"
+PUNISHMENTS_FILE = "punishments.json"
+CUSTOM_RULES_FILE = "custom_rules.json"
+SAVE_INTERVAL = 25
+
+EMAIL_CONFIG = {
+    "smtp_server": os.environ.get("SMTP_SERVER", "smtp.gmail.com"),
+    "smtp_port": int(os.environ.get("SMTP_PORT", "587")),
+    "sender_email": os.environ.get("SENDER_EMAIL", ""),
+    "sender_password": os.environ.get("SENDER_PASSWORD", ""),
+    "recipient_email": os.environ.get("RECIPIENT_EMAIL", "")
+}
+
+DEFAULT_RULES = {
+    "spam": {"name": "Спам", "penalty": 10, "description": "Массовая рассылка сообщений"},
+    "insult": {"name": "Оскорбления", "penalty": 20, "description": "Оскорбление участников"},
+    "advert": {"name": "Реклама", "penalty": 30, "description": "Несанкционированная реклама"},
+    "flood": {"name": "Флуд", "penalty": 5, "description": "Много сообщений подряд"},
+    "nsfw": {"name": "NSFW контент", "penalty": 50, "description": "Запрещенный контент"},
+    "offtopic": {"name": "Оффтоп", "penalty": 3, "description": "Сообщения не по теме"},
+    "caps": {"name": "Капс", "penalty": 2, "description": "Много заглавных букв"}
+}
+
+ANIMALS = {
+    "свинка": {
+        "name": "🐷 Свинка",
+        "rarity_weights": {
+            "Обычная": 40,
+            "Необычная": 30,
+            "Редкая": 20,
+            "Эпическая": 7,
+            "Мифическая": 3
+        },
+        "base_income": 3,
+        "emoji": "🐷"
+    },
+    "котик": {
+        "name": "🐱 Котик",
+        "rarity_weights": {
+            "Обычная": 35,
+            "Необычная": 30,
+            "Редкая": 22,
+            "Эпическая": 9,
+            "Мифическая": 4
+        },
+        "base_income": 4,
+        "emoji": "🐱"
+    },
+    "ящерица": {
+        "name": "🦎 Ящерица",
+        "rarity_weights": {
+            "Обычная": 30,
+            "Необычная": 25,
+            "Редкая": 25,
+            "Эпическая": 15,
+            "Мифическая": 5
+        },
+        "base_income": 5,
+        "emoji": "🦎"
+    }
+}
+
+RARITY_MULTIPLIERS = {
+    "Обычная": 1,
+    "Необычная": 2,
+    "Редкая": 3,
+    "Эпическая": 5,
+    "Мифическая": 8
+}
+
+RARITY_COLORS = {
+    "Обычная": "⚪️",
+    "Необычная": "🟢",
+    "Редкая": "🔵",
+    "Эпическая": "🟣",
+    "Мифическая": "🟡"
+}
+
+FARM_ACHIEVEMENTS = {
+    "first_animal": {
+        "name": "🐣 Начинающий фермер",
+        "desc": "Получить первое животное",
+        "reward": 5
+    },
+    "five_animals": {
+        "name": "🌱 Зоолюбитель",
+        "desc": "Собрать 5 животных",
+        "reward": 10
+    },
+    "ten_animals": {
+        "name": "🌿 Фермер-любитель",
+        "desc": "Собрать 10 животных",
+        "reward": 20
+    },
+    "twenty_animals": {
+        "name": "🌳 Опытный фермер",
+        "desc": "Собрать 20 животных",
+        "reward": 30
+    },
+    "rare_collector": {
+        "name": "💎 Коллекционер",
+        "desc": "Собрать 3 редких животных",
+        "reward": 15
+    },
+    "epic_collector": {
+        "name": "✨ Собиратель легенд",
+        "desc": "Собрать 2 эпических животных",
+        "reward": 30
+    },
+    "mythic_collector": {
+        "name": "👑 Повелитель мифов",
+        "desc": "Получить мифическое животное",
+        "reward": 50
+    },
+    "full_house": {
+        "name": "🎪 Полный двор",
+        "desc": "Иметь всех видов животных",
+        "reward": 40
+    },
+    "first_exchange": {
+        "name": "💱 Первая сделка",
+        "desc": "Обменять валюту на рейтинг",
+        "reward": 5
+    }
+}
+
+class SocialRatingBot:
+    def __init__(self) -> None:
+        self.users_db: Dict[str, Dict[str, Any]] = {}
+        self.animals_db: Dict[str, Dict[str, Any]] = {}
+        self.achievements_db: Dict[str, Dict[str, Any]] = {}
+        self.banned_users: Dict[str, Dict[str, Any]] = {}
+        self.punishments_db: Dict[str, list] = {}
+        self.custom_rules_db: Dict[str, Dict[str, Any]] = {}
+        self.pending_actions: Dict[str, Dict[str, Any]] = {}
+        self.load_data()
+        self.load_animals()
+        self.load_achievements()
+        self.load_banned_users()
+        self.load_punishments()
+        self.load_custom_rules()
+        
+    def load_data(self) -> None:
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.users_db = data.get('users', {})
+                logger.info(f"📊 Данные загружены: {len(self.users_db)} пользователей")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки данных: {e}")
+
+    def load_animals(self) -> None:
+        if os.path.exists(ANIMALS_FILE):
+            try:
+                with open(ANIMALS_FILE, 'r', encoding='utf-8') as f:
+                    self.animals_db = json.load(f)
+                logger.info(f"🐾 Животные загружены: {len(self.animals_db)} игроков")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки животных: {e}")
+
+    def load_achievements(self) -> None:
+        if os.path.exists(ACHIEVEMENTS_FILE):
+            try:
+                with open(ACHIEVEMENTS_FILE, 'r', encoding='utf-8') as f:
+                    self.achievements_db = json.load(f)
+                logger.info(f"🏆 Достижения загружены: {len(self.achievements_db)} игроков")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки достижений: {e}")
+
+    def load_banned_users(self) -> None:
+        if os.path.exists(BANNED_USERS_FILE):
+            try:
+                with open(BANNED_USERS_FILE, 'r', encoding='utf-8') as f:
+                    self.banned_users = json.load(f)
+                logger.info(f"🚫 Забанено: {len(self.banned_users)} пользователей")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки банов: {e}")
+
+    def load_punishments(self) -> None:
+        if os.path.exists(PUNISHMENTS_FILE):
+            try:
+                with open(PUNISHMENTS_FILE, 'r', encoding='utf-8') as f:
+                    self.punishments_db = json.load(f)
+                logger.info(f"⚖️ История наказаний: {len(self.punishments_db)} записей")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки наказаний: {e}")
+
+    def load_custom_rules(self) -> None:
+        if os.path.exists(CUSTOM_RULES_FILE):
+            try:
+                with open(CUSTOM_RULES_FILE, 'r', encoding='utf-8') as f:
+                    self.custom_rules_db = json.load(f)
+                logger.info(f"📝 Пользовательских правил: {len(self.custom_rules_db)}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки правил: {e}")
+
+    def save_data(self) -> None:
+        try:
+            with open(DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'users': self.users_db}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения данных: {e}")
+
+    def save_animals(self) -> None:
+        try:
+            with open(ANIMALS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.animals_db, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения животных: {e}")
+
+    def save_achievements(self) -> None:
+        try:
+            with open(ACHIEVEMENTS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.achievements_db, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения достижений: {e}")
+
+    def save_banned_users(self) -> None:
+        try:
+            with open(BANNED_USERS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.banned_users, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения банов: {e}")
+
+    def save_punishments(self) -> None:
+        try:
+            with open(PUNISHMENTS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.punishments_db, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения наказаний: {e}")
+
+    def save_custom_rules(self) -> None:
+        try:
+            with open(CUSTOM_RULES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.custom_rules_db, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения правил: {e}")
+
+    async def save_all_async(self) -> None:
+        await asyncio.sleep(0.1)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.save_data)
+        await loop.run_in_executor(None, self.save_animals)
+        await loop.run_in_executor(None, self.save_achievements)
+        await loop.run_in_executor(None, self.save_banned_users)
+        await loop.run_in_executor(None, self.save_punishments)
+        await loop.run_in_executor(None, self.save_custom_rules)
+
+    def init_user(self, user_id: int, username: str = None, first_name: str = None) -> None:
+        user_id = str(user_id)
+        
+        if user_id not in self.users_db:
+            self.users_db[user_id] = {
+                "rating": 0,
+                "farm_currency": 0,
+                "messages": 0,
+                "username": username,
+                "first_name": first_name,
+                "last_active": datetime.now().timestamp(),
+                "daily_bonus": None,
+                "total_exchanged": 0,
+                "total_punishments": 0,
+                "last_punishment": None
+            }
+        else:
+            user = self.users_db[user_id]
+            if "farm_currency" not in user:
+                user["farm_currency"] = 0
+            if "total_exchanged" not in user:
+                user["total_exchanged"] = 0
+            if "total_punishments" not in user:
+                user["total_punishments"] = 0
+
+        if user_id not in self.animals_db:
+            self.animals_db[user_id] = {
+                "inventory": {},
+                "last_collect": None
+            }
+
+        if user_id not in self.achievements_db:
+            self.achievements_db[user_id] = {
+                "completed": [],
+                "stats": {
+                    "animals_collected": 0,
+                    "rare_animals": 0,
+                    "epic_animals": 0,
+                    "mythic_animals": 0,
+                    "total_exchanged": 0,
+                    "unique_animals": []
+                }
+            }
+
+    def get_all_rules(self) -> Dict:
+        all_rules = DEFAULT_RULES.copy()
+        all_rules.update(self.custom_rules_db)
+        return all_rules
+
+    def get_rarity(self, animal_type: str) -> str:
+        weights = ANIMALS[animal_type]["rarity_weights"]
+        return random.choices(list(weights.keys()), weights=list(weights.values()))[0]
+
+    def calculate_income(self, user_id: str) -> int:
+        if user_id not in self.animals_db:
+            return 0
+        inventory = self.animals_db[user_id].get("inventory", {})
+        total_income = 0
+        for animal_type, data in inventory.items():
+            base_income = ANIMALS[animal_type]["base_income"]
+            for rarity, count in data.get("by_rarity", {}).items():
+                multiplier = RARITY_MULTIPLIERS.get(rarity, 1)
+                total_income += base_income * multiplier * count
+        return total_income
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in ADMIN_IDS
+
+    def is_banned(self, user_id: int) -> bool:
+        return str(user_id) in self.banned_users
+
+    async def check_admin(self, update: Update) -> bool:
+        user = update.effective_user
+        if not user or not self.is_admin(user.id):
+            await self.safe_edit(update, "⛔️ У вас нет прав доступа к этой функции.", self.get_back_button())
+            return False
+        return True
+
+    async def safe_edit(self, update: Update, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+        try:
+            if update.callback_query:
+                await update.callback_query.message.edit_text(text, reply_markup=reply_markup)
+            elif update.message:
+                await update.message.reply_text(text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"❌ Ошибка при отправке: {e}")
+
+    def get_back_button(self, back_to: str = "main") -> InlineKeyboardMarkup:
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_{back_to}")]]
+        return InlineKeyboardMarkup(keyboard)
+
+    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user:
+            return
+
+        if self.is_banned(user.id):
+            ban_info = self.banned_users.get(str(user.id), {})
+            reason = ban_info.get("reason", "Не указана")
+            await self.safe_edit(update, f"🚫 Вы заблокированы!\nПричина: {reason}", None)
+            return
+
+        self.init_user(user.id, user.username, user.first_name)
+        is_admin = self.is_admin(user.id)
+
+        keyboard = [
+            [InlineKeyboardButton("⭐️ Мой рейтинг", callback_data="rating")],
+            [InlineKeyboardButton("🌾 Моя ферма", callback_data="farm")],
+            [InlineKeyboardButton("💰 Ежедневный бонус", callback_data="daily_bonus")],
+            [InlineKeyboardButton("🏆 Достижения", callback_data="achievements")]
+        ]
+
+        if is_admin:
+            keyboard.append([InlineKeyboardButton("👑 Админ панель", callback_data="admin")])
+
+        welcome_text = (
+            f"👋 Добро пожаловать{', Администратор' if is_admin else ''} {user.first_name}!\n\n"
+            f"🐾 На ферме можно собирать животных разной редкости!\n"
+            f"⚪️ Обычная → 🟢 Необычная → 🔵 Редкая → 🟣 Эпическая → 🟡 Мифическая\n\n"
+            f"Выберите действие:"
+        )
+
+        await self.safe_edit(update, welcome_text, InlineKeyboardMarkup(keyboard))
+
+    async def generate_report(self) -> str:
+        total_users = len(self.users_db)
+        total_messages = sum(u.get("messages", 0) for u in self.users_db.values())
+        total_rating = sum(u.get("rating", 0) for u in self.users_db.values())
+        total_currency = sum(u.get("farm_currency", 0) for u in self.users_db.values())
+        total_banned = len(self.banned_users)
+        total_punishments = sum(len(p) for p in self.punishments_db.values())
+        
+        top_users = sorted(
+            self.users_db.items(),
+            key=lambda x: x[1].get("rating", 0),
+            reverse=True
+        )[:5]
+        
+        top_text = "\n".join([
+            f"{i+1}. {data.get('first_name', 'Неизвестно')} (ID: {uid}): {data.get('rating', 0)}⭐️"
+            for i, (uid, data) in enumerate(top_users)
+        ])
+        
+        report = f"""
+📊 ОТЧЕТ БОТА
+📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+
+👥 ОБЩАЯ СТАТИСТИКА:
+• Пользователей: {total_users}
+• Заблокировано: {total_banned}
+• Сообщений: {total_messages}
+• Всего рейтинга: {total_rating}⭐️
+• Всего валюты: {total_currency}🌽
+• Наказаний: {total_punishments}
+
+🏆 ТОП-5 ПО РЕЙТИНГУ:
+{top_text}
+
+⚙️ НАСТРОЙКИ:
+• Сохранение: раз в {SAVE_INTERVAL} сообщений
+• Животных: {len(ANIMALS)} вида
+• Достижений: {len(FARM_ACHIEVEMENTS)}
+• Администраторов: {len(ADMIN_IDS)}
+"""
+        return report
+
+    async def send_email_report(self, update: Update) -> None:
+        if not EMAIL_CONFIG["sender_email"] or not EMAIL_CONFIG["sender_password"]:
+            await self.safe_edit(update, "❌ Email не настроен. Укажите переменные окружения SENDER_EMAIL и SENDER_PASSWORD.", self.get_back_button("admin"))
+            return
+            
+        try:
+            report_text = await self.generate_report()
+            
+            msg = MIMEMultipart()
+            msg['From'] = EMAIL_CONFIG["sender_email"]
+            msg['To'] = EMAIL_CONFIG["recipient_email"]
+            msg['Subject'] = f"Отчет бота от {datetime.now().strftime('%d.%m.%Y')}"
+            
+            msg.attach(MIMEText(report_text, 'plain', 'utf-8'))
+            
+            context = ssl.create_default_context()
+            with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as server:
+                server.starttls(context=context)
+                server.login(EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"])
+                server.send_message(msg)
+            
+            await self.safe_edit(update, f"✅ Отчет успешно отправлен на {EMAIL_CONFIG['recipient_email']}!", self.get_back_button("admin"))
+            logger.info(f"Отчет отправлен на {EMAIL_CONFIG['recipient_email']}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки email: {e}")
+            await self.safe_edit(update, f"❌ Ошибка отправки отчета: {str(e)}", self.get_back_button("admin"))
+
+    async def show_admin_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton("👥 Управление пользователями", callback_data="admin_users_menu")],
+            [InlineKeyboardButton("⚖️ Наказания", callback_data="admin_punish_menu")],
+            [InlineKeyboardButton("💰 Управление валютой", callback_data="admin_currency_menu")],
+            [InlineKeyboardButton("🚫 Блокировка", callback_data="admin_ban_menu")],
+            [InlineKeyboardButton("📜 История наказаний", callback_data="admin_punish_history")],
+            [InlineKeyboardButton("📧 Отчет на почту", callback_data="admin_report")],
+            [InlineKeyboardButton("🔄 Сброс рейтинга", callback_data="admin_reset")],
+            [InlineKeyboardButton("🔙 В главное меню", callback_data="back_to_main")]
+        ]
+
+        await self.safe_edit(update, "👑 АДМИН ПАНЕЛЬ\n\nВыберите действие:", InlineKeyboardMarkup(keyboard))
+
+    async def admin_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+            
+        await self.safe_edit(update, "📧 Отправка отчета...\n\nПожалуйста, подождите.", None)
+        await self.send_email_report(update)
+
+    async def admin_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        total_users = len(self.users_db)
+        total_messages = sum(u.get("messages", 0) for u in self.users_db.values())
+        total_rating = sum(u.get("rating", 0) for u in self.users_db.values())
+        total_currency = sum(u.get("farm_currency", 0) for u in self.users_db.values())
+        total_banned = len(self.banned_users)
+        total_punishments = sum(len(p) for p in self.punishments_db.values())
+        
+        text = (
+            f"📊 ОБЩАЯ СТАТИСТИКА\n\n"
+            f"👥 Пользователей: {total_users}\n"
+            f"🚫 Заблокировано: {total_banned}\n"
+            f"💬 Сообщений: {total_messages}\n"
+            f"⭐️ Всего рейтинга: {total_rating}\n"
+            f"💰 Всего валюты: {total_currency}\n"
+            f"⚖️ Наказаний: {total_punishments}\n\n"
+            f"⚙️ Настройки:\n"
+            f"• Сохранение: раз в {SAVE_INTERVAL} сообщений\n"
+            f"• Животных: {len(ANIMALS)} вида\n"
+            f"• Достижений: {len(FARM_ACHIEVEMENTS)}"
+        )
+
+        await self.safe_edit(update, text, self.get_back_button("admin"))
+
+    async def admin_users_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("📋 Список пользователей", callback_data="admin_users_list")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin")]
+        ]
+        await self.safe_edit(update, "👥 УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ\n\nВыберите действие:", InlineKeyboardMarkup(keyboard))
+
+    async def admin_users_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        text = "👥 ПОСЛЕДНИЕ 20 ПОЛЬЗОВАТЕЛЕЙ:\n\n"
+        sorted_users = sorted(self.users_db.items(), key=lambda x: x[1].get("last_active", 0), reverse=True)[:20]
+
+        for i, (user_id, data) in enumerate(sorted_users, 1):
+            name = data.get("first_name") or data.get("username") or "Без имени"
+            rating = data.get("rating", 0)
+            currency = data.get("farm_currency", 0)
+            messages = data.get("messages", 0)
+            status = "🚫" if user_id in self.banned_users else "✅"
+            text += f"{status} {i}. {name}\n   ID: {user_id} | ⭐️ {rating} | 🌽 {currency} | 💬 {messages}\n"
+
+        await self.safe_edit(update, text, self.get_back_button("admin_users_menu"))
+
+    async def admin_punish_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        all_rules = self.get_all_rules()
+        keyboard = []
+        for rule_key, rule in all_rules.items():
+            is_custom = "🆕 " if rule_key in self.custom_rules_db else ""
+            keyboard.append([InlineKeyboardButton(f"{is_custom}{rule['name']} (-{rule['penalty']}⭐️)", callback_data=f"punish_select_{rule_key}")])
+        
+        keyboard.append([InlineKeyboardButton("➕ Создать правило", callback_data="admin_add_rule")])
+        keyboard.append([InlineKeyboardButton("➖ Удалить правило", callback_data="admin_remove_rule")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin")])
+
+        await self.safe_edit(update, "⚖️ ВЫБЕРИТЕ НАРУШЕНИЕ\n\nПосле выбора нужно будет ввести ID пользователя:", InlineKeyboardMarkup(keyboard))
+
+    async def admin_currency_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить валюту", callback_data="admin_add_currency")],
+            [InlineKeyboardButton("➖ Забрать валюту", callback_data="admin_remove_currency")],
+            [InlineKeyboardButton("⭐️ Добавить рейтинг", callback_data="admin_add_rating")],
+            [InlineKeyboardButton("💫 Забрать рейтинг", callback_data="admin_remove_rating")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin")]
+        ]
+
+        await self.safe_edit(update, "💰 УПРАВЛЕНИЕ ВАЛЮТОЙ\n\nКурс: 10🌽 = 1⭐️\n\nВыберите действие:", InlineKeyboardMarkup(keyboard))
+
+    async def admin_ban_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("🚫 Заблокировать", callback_data="admin_ban_user")],
+            [InlineKeyboardButton("✅ Разблокировать", callback_data="admin_unban_user")],
+            [InlineKeyboardButton("📋 Список заблокированных", callback_data="admin_banned_list")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin")]
+        ]
+
+        await self.safe_edit(update, "🚫 БЛОКИРОВКА ПОЛЬЗОВАТЕЛЕЙ\n\nВыберите действие:", InlineKeyboardMarkup(keyboard))
+
+    async def admin_punish_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        if not self.punishments_db:
+            await self.safe_edit(update, "📜 История наказаний пуста", self.get_back_button("admin"))
+            return
+
+        text = "📜 ПОСЛЕДНИЕ НАКАЗАНИЯ:\n\n"
+        all_punishments = []
+        for user_id, punishments in self.punishments_db.items():
+            for p in punishments:
+                all_punishments.append((user_id, p))
+        all_punishments.sort(key=lambda x: x[1]['date'], reverse=True)
+
+        for user_id, p in all_punishments[:15]:
+            user_info = self.users_db.get(user_id, {})
+            name = user_info.get("first_name") or user_info.get("username") or f"ID {user_id}"
+            date = datetime.fromisoformat(p['date']).strftime("%d.%m.%Y %H:%M")
+            text += f"👤 {name}\n📅 {date}\n⚖️ {p['rule_name']} (-{p['penalty']}⭐️)\n👮 Админ ID: {p['admin_id']}\n⭐️ {p['previous_rating']} → {p['new_rating']}\n\n"
+
+        await self.safe_edit(update, text, self.get_back_button("admin"))
+
+    async def admin_banned_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        if not self.banned_users:
+            await self.safe_edit(update, "🚫 Нет заблокированных пользователей", self.get_back_button("admin_ban_menu"))
+            return
+
+        text = "🚫 ЗАБЛОКИРОВАННЫЕ ПОЛЬЗОВАТЕЛИ:\n\n"
+        for user_id, ban_info in self.banned_users.items():
+            user_info = self.users_db.get(user_id, {})
+            name = user_info.get("first_name") or user_info.get("username") or f"ID {user_id}"
+            reason = ban_info.get("reason", "Не указана")
+            date = ban_info.get("date", "Неизвестно")
+            text += f"👤 {name}\n  ID: {user_id}\n  Причина: {reason}\n  Дата: {date}\n\n"
+
+        await self.safe_edit(update, text, self.get_back_button("admin_ban_menu"))
+
+    async def show_rating(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or self.is_banned(user.id):
+            return
+
+        self.init_user(user.id, user.username, user.first_name)
+        user_data = self.users_db[str(user.id)]
+        text = f"⭐️ {user.first_name}, ваш рейтинг: {user_data['rating']}\n💰 Валюта фермы: {user_data['farm_currency']} 🌽\n\n📊 Статистика:\n💬 Сообщений: {user_data['messages']}\n💱 Всего обменяно: {user_data['total_exchanged']} 🌽\n⚖️ Наказаний: {user_data.get('total_punishments', 0)}"
+        await self.safe_edit(update, text, self.get_back_button())
+
+    async def show_farm_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or self.is_banned(user.id):
+            return
+
+        self.init_user(user.id, user.username, user.first_name)
+        user_id = str(user.id)
+        income = self.calculate_income(user_id)
+        
+        text = f"🌾 МОЯ ФЕРМА\n\n💰 Валюта: {self.users_db[user_id]['farm_currency']} 🌽\n⏱ Доход в час: {income} 🌽\n\nВыберите действие:"
+        keyboard = [
+            [InlineKeyboardButton("🎲 Купить животное (10🌽)", callback_data="buy_animal")],
+            [InlineKeyboardButton("📦 Инвентарь", callback_data="inventory")],
+            [InlineKeyboardButton("💱 Обменять на рейтинг", callback_data="exchange")],
+            [InlineKeyboardButton("🌾 Собрать доход", callback_data="collect_income")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+        ]
+        await self.safe_edit(update, text, InlineKeyboardMarkup(keyboard))
+
+    async def buy_animal(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or self.is_banned(user.id):
+            return
+
+        user_id = str(user.id)
+        cost = 10
+
+        if self.users_db[user_id]['farm_currency'] < cost:
+            await self.safe_edit(update, f"❌ Недостаточно валюты! Нужно: {cost}🌽", self.get_back_button("farm"))
+            return
+
+        animal_type = random.choice(list(ANIMALS.keys()))
+        rarity = self.get_rarity(animal_type)
+        
+        if animal_type not in self.animals_db[user_id]["inventory"]:
+            self.animals_db[user_id]["inventory"][animal_type] = {"count": 0, "by_rarity": {}}
+        
+        self.animals_db[user_id]["inventory"][animal_type]["count"] += 1
+        rarity_count = self.animals_db[user_id]["inventory"][animal_type]["by_rarity"].get(rarity, 0)
+        self.animals_db[user_id]["inventory"][animal_type]["by_rarity"][rarity] = rarity_count + 1
+        self.users_db[user_id]['farm_currency'] -= cost
+        
+        new_achievements = await self.check_animal_achievements(user_id)
+        asyncio.create_task(self.save_all_async())
+        
+        color = RARITY_COLORS[rarity]
+        animal_info = ANIMALS[animal_type]
+        
+        text = f"✅ Вы купили животное!\n\n{color} {animal_info['name']}\n✨ Редкость: {rarity}\n💰 Доход: {animal_info['base_income'] * RARITY_MULTIPLIERS[rarity]}🌽/час\n\nПотрачено: {cost}🌽"
+        
+        if new_achievements:
+            text += "\n\n🏆 НОВЫЕ ДОСТИЖЕНИЯ:\n" + "\n".join(f"• {FARM_ACHIEVEMENTS[ach]['name']} +{FARM_ACHIEVEMENTS[ach]['reward']}⭐️" for ach in new_achievements)
+
+        await self.safe_edit(update, text, self.get_back_button("farm"))
+
+    async def check_animal_achievements(self, user_id: str) -> list:
+        user_achievements = self.achievements_db[user_id].get("completed", [])
+        new_achievements = []
+        
+        total_animals = 0
+        rare_count = epic_count = mythic_count = 0
+        unique_types = set()
+        
+        inventory = self.animals_db[user_id].get("inventory", {})
+        for animal_type, data in inventory.items():
+            for rarity, count in data.get("by_rarity", {}).items():
+                total_animals += count
+                if count > 0:
+                    unique_types.add(animal_type)
+                if rarity == "Редкая":
+                    rare_count += count
+                elif rarity == "Эпическая":
+                    epic_count += count
+                elif rarity == "Мифическая":
+                    mythic_count += count
+        
+        checks = [
+            (total_animals >= 1, "first_animal"),
+            (total_animals >= 5, "five_animals"),
+            (total_animals >= 10, "ten_animals"),
+            (total_animals >= 20, "twenty_animals"),
+            (rare_count >= 3, "rare_collector"),
+            (epic_count >= 2, "epic_collector"),
+            (mythic_count >= 1, "mythic_collector"),
+            (len(unique_types) >= 3, "full_house")
+        ]
+        
+        for condition, ach_id in checks:
+            if condition and ach_id not in user_achievements:
+                new_achievements.append(ach_id)
+                self.users_db[user_id]["rating"] += FARM_ACHIEVEMENTS[ach_id]["reward"]
+        
+        if new_achievements:
+            user_achievements.extend(new_achievements)
+            self.achievements_db[user_id]["completed"] = user_achievements
+        
+        return new_achievements
+
+    async def show_inventory(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or self.is_banned(user.id):
+            return
+
+        user_id = str(user.id)
+        if user_id not in self.animals_db or not self.animals_db[user_id]["inventory"]:
+            await self.safe_edit(update, "📦 Инвентарь пуст\n\nКупите животных в ферме!", self.get_back_button("farm"))
+            return
+
+        text = "📦 ВАШ ИНВЕНТАРЬ:\n\n"
+        total_animals = 0
+        by_rarity = {r: 0 for r in RARITY_MULTIPLIERS.keys()}
+        
+        for animal_type, data in self.animals_db[user_id]["inventory"].items():
+            animal_name = ANIMALS[animal_type]["emoji"]
+            text += f"\n{animal_name}:\n"
+            for rarity, count in data.get("by_rarity", {}).items():
+                if count > 0:
+                    text += f"  {RARITY_COLORS[rarity]} {rarity}: {count}\n"
+                    by_rarity[rarity] += count
+                    total_animals += count
+        
+        text += f"\n📊 ВСЕГО ЖИВОТНЫХ: {total_animals}\n"
+        for rarity, count in by_rarity.items():
+            text += f"{RARITY_COLORS[rarity]} {rarity}: {count}\n"
+
+        await self.safe_edit(update, text, self.get_back_button("farm"))
+
+    async def collect_income(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or self.is_banned(user.id):
+            return
+
+        user_id = str(user.id)
+        last_collect = self.animals_db[user_id].get("last_collect")
+        now = datetime.now()
+        
+        if last_collect:
+            last = datetime.fromtimestamp(last_collect)
+            if (now - last).total_seconds() < 3600:
+                remaining = int(3600 - (now - last).total_seconds()) // 60
+                await self.safe_edit(update, f"❌ До сбора осталось: {remaining} минут", self.get_back_button("farm"))
+                return
+        
+        income = self.calculate_income(user_id)
+        self.users_db[user_id]['farm_currency'] += income
+        self.animals_db[user_id]["last_collect"] = now.timestamp()
+        asyncio.create_task(self.save_all_async())
+        
+        await self.safe_edit(update, f"✅ Вы собрали доход: +{income}🌽\n💰 Теперь у вас: {self.users_db[user_id]['farm_currency']}🌽", self.get_back_button("farm"))
+
+    async def exchange_currency(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or self.is_banned(user.id):
+            return
+
+        user_id = str(user.id)
+        currency = self.users_db[user_id]['farm_currency']
+        
+        if currency < 10:
+            await self.safe_edit(update, "❌ Минимум для обмена: 10🌽", self.get_back_button("farm"))
+            return
+        
+        rating_gain = currency // 10
+        amount = rating_gain * 10
+        
+        self.users_db[user_id]['farm_currency'] -= amount
+        self.users_db[user_id]['rating'] += rating_gain
+        self.users_db[user_id]['total_exchanged'] += amount
+        asyncio.create_task(self.save_all_async())
+        
+        await self.safe_edit(update, f"✅ Обмен выполнен!\n💱 {amount}🌽 → +{rating_gain}⭐️\n\n💰 Осталось: {self.users_db[user_id]['farm_currency']}🌽\n⭐️ Рейтинг: {self.users_db[user_id]['rating']}", self.get_back_button("farm"))
+
+    async def show_achievements(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or self.is_banned(user.id):
+            return
+
+        user_id = str(user.id)
+        completed = self.achievements_db[user_id].get("completed", [])
+        
+        text = "🏆 ДОСТИЖЕНИЯ ФЕРМЫ:\n\n"
+        for ach_id, ach_data in FARM_ACHIEVEMENTS.items():
+            status = "✅" if ach_id in completed else "❌"
+            text += f"{status} {ach_data['name']}: {ach_data['desc']} (+{ach_data['reward']}⭐️)\n"
+
+        await self.safe_edit(update, text, self.get_back_button("main"))
+
+    async def daily_bonus(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or self.is_banned(user.id):
+            return
+
+        user_id = str(user.id)
+        user_data = self.users_db[user_id]
+        last_bonus = user_data.get("daily_bonus")
+        now = datetime.now()
+
+        if last_bonus and datetime.fromtimestamp(last_bonus).date() == now.date():
+            await self.safe_edit(update, "❌ Вы уже получали бонус сегодня! Приходите завтра.", self.get_back_button("main"))
+            return
+
+        bonus = random.randint(2, 10)
+        user_data["rating"] += bonus
+        user_data["daily_bonus"] = now.timestamp()
+        asyncio.create_task(self.save_all_async())
+        await self.safe_edit(update, f"💰 Ежедневный бонус: +{bonus}⭐️!", self.get_back_button("main"))
+
+    async def admin_add_currency(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+        self.pending_actions[str(update.effective_user.id)] = {"action": "add_currency", "step": "waiting_for_id"}
+        await self.safe_edit(update, "💰 ДОБАВЛЕНИЕ ВАЛЮТЫ\n\nВведите ID пользователя:", self.get_back_button("admin_currency_menu"))
+
+    async def admin_remove_currency(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+        self.pending_actions[str(update.effective_user.id)] = {"action": "remove_currency", "step": "waiting_for_id"}
+        await self.safe_edit(update, "💰 ЗАБОР ВАЛЮТЫ\n\nВведите ID пользователя:", self.get_back_button("admin_currency_menu"))
+
+    async def admin_add_rating(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+        self.pending_actions[str(update.effective_user.id)] = {"action": "add_rating", "step": "waiting_for_id"}
+        await self.safe_edit(update, "⭐️ ДОБАВЛЕНИЕ РЕЙТИНГА\n\nВведите ID пользователя:", self.get_back_button("admin_currency_menu"))
+
+    async def admin_remove_rating(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+        self.pending_actions[str(update.effective_user.id)] = {"action": "remove_rating", "step": "waiting_for_id"}
+        await self.safe_edit(update, "⭐️ ЗАБОР РЕЙТИНГА\n\nВведите ID пользователя:", self.get_back_button("admin_currency_menu"))
+
+    async def admin_ban_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+        self.pending_actions[str(update.effective_user.id)] = {"action": "ban_user", "step": "waiting_for_id"}
+        await self.safe_edit(update, "🚫 БЛОКИРОВКА ПОЛЬЗОВАТЕЛЯ\n\nВведите ID пользователя для блокировки:", self.get_back_button("admin_ban_menu"))
+
+    async def admin_unban_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+        self.pending_actions[str(update.effective_user.id)] = {"action": "unban_user", "step": "waiting_for_id"}
+        await self.safe_edit(update, "✅ РАЗБЛОКИРОВКА ПОЛЬЗОВАТЕЛЯ\n\nВведите ID пользователя для разблокировки:", self.get_back_button("admin_ban_menu"))
+
+    async def admin_add_rule_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+        self.pending_actions[str(update.effective_user.id)] = {"action": "add_rule", "step": "waiting_for_key"}
+        await self.safe_edit(update, "➕ ДОБАВЛЕНИЕ ПРАВИЛА\n\nВведите уникальный ключ (латиницей, без пробелов):", self.get_back_button("admin_punish_menu"))
+
+    async def admin_remove_rule_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+        if not self.custom_rules_db:
+            await self.safe_edit(update, "❌ Нет пользовательских правил для удаления!", self.get_back_button("admin_punish_menu"))
+            return
+
+        text = "➖ УДАЛЕНИЕ ПРАВИЛА\n\nПользовательские правила:\n" + "\n".join(f"• {key}: {rule['name']} (-{rule['penalty']}⭐️)" for key, rule in self.custom_rules_db.items()) + "\n\nВведите ключ правила для удаления:"
+        self.pending_actions[str(update.effective_user.id)] = {"action": "remove_rule", "step": "waiting_for_key"}
+        await self.safe_edit(update, text, self.get_back_button("admin_punish_menu"))
+
+    async def admin_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, сбросить", callback_data="admin_reset_confirm"),
+            InlineKeyboardButton("❌ Отмена", callback_data="admin")
+        ]])
+        await self.safe_edit(update, "⚠️ Сбросить рейтинг ВСЕХ пользователей?\nЭто действие нельзя отменить!", keyboard)
+
+    async def admin_reset_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_admin(update):
+            return
+
+        for user_id in self.users_db:
+            self.users_db[user_id]["rating"] = 0
+        asyncio.create_task(self.save_all_async())
+        await self.safe_edit(update, "✅ Рейтинг всех пользователей сброшен!", self.get_back_button("admin"))
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or not update.message or self.is_banned(user.id):
+            return
+
+        user_id = str(user.id)
+        text = update.message.text.strip()
+
+        if user_id in self.pending_actions:
+            action_data = self.pending_actions[user_id]
+            action, step = action_data["action"], action_data["step"]
+
+            if action == "add_currency" and step == "waiting_for_id":
+                action_data["target_id"], action_data["step"] = text, "waiting_for_amount"
+                await self.safe_edit(update, f"💰 Введите сумму для пользователя {text}:", self.get_back_button("admin_currency_menu"))
+                return
+            elif action == "add_currency" and step == "waiting_for_amount":
+                try:
+                    amount, target_id = int(text), action_data["target_id"]
+                    self.init_user(int(target_id))
+                    self.users_db[target_id]["farm_currency"] += amount
+                    asyncio.create_task(self.save_all_async())
+                    await self.safe_edit(update, f"✅ Добавлено {amount}🌽 пользователю {self.users_db[target_id].get('first_name', target_id)}", self.get_back_button("admin_currency_menu"))
+                except ValueError:
+                    await self.safe_edit(update, "❌ Введите число!", self.get_back_button("admin_currency_menu"))
+                del self.pending_actions[user_id]
+                return
+
+            elif action == "remove_currency" and step == "waiting_for_id":
+                action_data["target_id"], action_data["step"] = text, "waiting_for_amount"
+                await self.safe_edit(update, f"💰 Введите сумму для забора у {text}:", self.get_back_button("admin_currency_menu"))
+                return
+            elif action == "remove_currency" and step == "waiting_for_amount":
+                try:
+                    amount, target_id = int(text), action_data["target_id"]
+                    if target_id in self.users_db:
+                        self.users_db[target_id]["farm_currency"] = max(0, self.users_db[target_id].get("farm_currency", 0) - amount)
+                        asyncio.create_task(self.save_all_async())
+                        await self.safe_edit(update, f"✅ Забрано {amount}🌽 у {self.users_db[target_id].get('first_name', target_id)}", self.get_back_button("admin_currency_menu"))
+                    else:
+                        await self.safe_edit(update, "❌ Пользователь не найден!", self.get_back_button("admin_currency_menu"))
+                except ValueError:
+                    await self.safe_edit(update, "❌ Введите число!", self.get_back_button("admin_currency_menu"))
+                del self.pending_actions[user_id]
+                return
+
+            elif action == "add_rating" and step == "waiting_for_id":
+                action_data["target_id"], action_data["step"] = text, "waiting_for_amount"
+                await self.safe_edit(update, f"⭐️ Введите количество рейтинга для {text}:", self.get_back_button("admin_currency_menu"))
+                return
+            elif action == "add_rating" and step == "waiting_for_amount":
+                try:
+                    amount, target_id = int(text), action_data["target_id"]
+                    self.init_user(int(target_id))
+                    self.users_db[target_id]["rating"] += amount
+                    asyncio.create_task(self.save_all_async())
+                    await self.safe_edit(update, f"✅ Добавлено {amount}⭐️ пользователю {self.users_db[target_id].get('first_name', target_id)}", self.get_back_button("admin_currency_menu"))
+                except ValueError:
+                    await self.safe_edit(update, "❌ Введите число!", self.get_back_button("admin_currency_menu"))
+                del self.pending_actions[user_id]
+                return
+
+            elif action == "remove_rating" and step == "waiting_for_id":
+                action_data["target_id"], action_data["step"] = text, "waiting_for_amount"
+                await self.safe_edit(update, f"⭐️ Введите количество рейтинга для забора у {text}:", self.get_back_button("admin_currency_menu"))
+                return
+            elif action == "remove_rating" and step == "waiting_for_amount":
+                try:
+                    amount, target_id = int(text), action_data["target_id"]
+                    if target_id in self.users_db:
+                        self.users_db[target_id]["rating"] = max(0, self.users_db[target_id].get("rating", 0) - amount)
+                        asyncio.create_task(self.save_all_async())
+                        await self.safe_edit(update, f"✅ Забрано {amount}⭐️ у {self.users_db[target_id].get('first_name', target_id)}", self.get_back_button("admin_currency_menu"))
+                    else:
+                        await self.safe_edit(update, "❌ Пользователь не найден!", self.get_back_button("admin_currency_menu"))
+                except ValueError:
+                    await self.safe_edit(update, "❌ Введите число!", self.get_back_button("admin_currency_menu"))
+                del self.pending_actions[user_id]
+                return
+
+            elif action == "ban_user" and step == "waiting_for_id":
+                target_id = text
+                if target_id in self.users_db:
+                    self.banned_users[target_id] = {"date": datetime.now().isoformat(), "reason": "Нарушение правил", "admin_id": user.id}
+                    asyncio.create_task(self.save_all_async())
+                    await self.safe_edit(update, f"🚫 Пользователь {self.users_db[target_id].get('first_name', target_id)} заблокирован!", self.get_back_button("admin_ban_menu"))
+                else:
+                    await self.safe_edit(update, "❌ Пользователь не найден!", self.get_back_button("admin_ban_menu"))
+                del self.pending_actions[user_id]
+                return
+
+            elif action == "unban_user" and step == "waiting_for_id":
+                target_id = text
+                if target_id in self.banned_users:
+                    del self.banned_users[target_id]
+                    asyncio.create_task(self.save_all_async())
+                    await self.safe_edit(update, f"✅ Пользователь {self.users_db.get(target_id, {}).get('first_name', target_id)} разблокирован!", self.get_back_button("admin_ban_menu"))
+                else:
+                    await self.safe_edit(update, "❌ Пользователь не найден в списке заблокированных!", self.get_back_button("admin_ban_menu"))
+                del self.pending_actions[user_id]
+                return
+
+        self.init_user(user.id, user.username, user.first_name)
+        user_data = self.users_db[user_id]
+        user_data["messages"] += 1
+        user_data["last_active"] = datetime.now().timestamp()
+
+        if not self.is_admin(user.id):
+            user_data["rating"] += random.randint(1, 3)
+
+        if user_data["messages"] % SAVE_INTERVAL == 0:
+            asyncio.create_task(self.save_all_async())
+
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+
+        handlers = {
+            "back_to_main": self.show_main_menu,
+            "back_to_farm": self.show_farm_menu,
+            "rating": self.show_rating,
+            "farm": self.show_farm_menu,
+            "daily_bonus": self.daily_bonus,
+            "achievements": self.show_achievements,
+            "buy_animal": self.buy_animal,
+            "inventory": self.show_inventory,
+            "collect_income": self.collect_income,
+            "exchange": self.exchange_currency,
+            "admin": self.show_admin_menu,
+            "admin_stats": self.admin_stats,
+            "admin_users_menu": self.admin_users_menu,
+            "admin_users_list": self.admin_users_list,
+            "admin_punish_menu": self.admin_punish_menu,
+            "admin_currency_menu": self.admin_currency_menu,
+            "admin_ban_menu": self.admin_ban_menu,
+            "admin_punish_history": self.admin_punish_history,
+            "admin_banned_list": self.admin_banned_list,
+            "admin_add_currency": self.admin_add_currency,
+            "admin_remove_currency": self.admin_remove_currency,
+            "admin_add_rating": self.admin_add_rating,
+            "admin_remove_rating": self.admin_remove_rating,
+            "admin_ban_user": self.admin_ban_user,
+            "admin_unban_user": self.admin_unban_user,
+            "admin_add_rule": self.admin_add_rule_start,
+            "admin_remove_rule": self.admin_remove_rule_start,
+            "admin_report": self.admin_report,
+            "admin_reset": self.admin_reset,
+            "admin_reset_confirm": self.admin_reset_confirm
+        }
+
+        if data in handlers:
+            await handlers[data](update, context)
+        elif data.startswith("punish_select_"):
+            rule_key = data.replace("punish_select_", "")
+            context.user_data['selected_rule'] = rule_key
+            await self.safe_edit(update, f"⚖️ Введите ID пользователя для наказания:", self.get_back_button("admin_punish_menu"))
+        else:
+            await query.message.edit_text("⏳ Функция в разработке", reply_markup=self.get_back_button("main"))
+
+def main() -> None:
+    if not BOT_TOKEN:
+        print("❌ Ошибка: Не указан BOT_TOKEN в переменных окружения!")
+        return
+    
+    bot = SocialRatingBot()
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", bot.show_main_menu))
+    application.add_handler(CommandHandler("menu", bot.show_main_menu))
+    application.add_handler(CallbackQueryHandler(bot.button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    
+    print("🤖 Бот с фермой и животными запущен!")
+    print(f"👑 Администраторы: {ADMIN_IDS}")
+    print(f"🐾 Животные: {len(ANIMALS)} вида")
+    print(f"💾 Сохранение: раз в {SAVE_INTERVAL} сообщений")
+    if EMAIL_CONFIG["sender_email"]:
+        print(f"📧 Отчеты: настроены")
+    else:
+        print(f"📧 Отчеты: не настроены (укажите SENDER_EMAIL)")
+    
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
